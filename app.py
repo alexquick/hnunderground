@@ -1,4 +1,7 @@
-import re, os, json, requests, simplejson
+import re, os, json, simplejson
+from gevent import monkey; monkey.patch_all()
+import requests
+from requests import async
 from flask import Flask, Response
 from itertools import chain
 from datetime import datetime
@@ -6,10 +9,10 @@ from flaskext.sqlalchemy import SQLAlchemy
 from readability.readability import Document
 import logging
 logging.basicConfig()
+logger = logging.Logger("hnunderground")
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL')
 db = SQLAlchemy(app)
-logger = logging.Logger("hnunderground")
 
 front_regex = """<a\sid=up_([0-9]*).*?vote.*?<a\shref="([^"]*)".*?>([^<]*)<"""
 
@@ -30,14 +33,24 @@ class Link(db.Model):
     self.article = None
     self.current = True
     
-  def refresh(self):
-    data = requests.get(self.url).text
-    self.article = Document(data).summary()
-    self.last_updated = datetime.now()
+  def refreshAsync(self):
+    def update(response):
+      self.article = Document(response.text).summary()
+      self.last_updated = datetime.now()
+    request = requests.async.get(self.url, hooks=dict( response= update))
+    return request
   
   def fill(self):
     if self.article is None:
-      self.refresh()
+      self.refreshAsync().send()
+  
+  @classmethod
+  def fillAll(cls, links):
+    reqs = []
+    for link in links:
+      if(link.article is None):
+        reqs.append(link.refreshAsync())
+    async.map(reqs)
     
 class HNParser(object):
   def __init__(self, pages = 1):
@@ -68,11 +81,7 @@ class HNParser(object):
 def hello():
   parser = HNParser()
   links = parser.results()
-  for link in links:
-    try:
-      link.fill()
-    except Exception as e:
-      logger.error(link.url, e);
+  Link.fillAll(links)
   db.session.commit()
   linkReps = [(l.id, l.url, l.title, l.article, l.last_updated) for l in links]
   rep = simplejson.dumps(linkReps, default=lambda x: repr(x))
