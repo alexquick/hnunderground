@@ -76,9 +76,16 @@ class HNParser(object):
       links.append(link)
     return links
     
-
 @app.route("/")
-def hello():
+def root():
+  rep = simplejson.dumps({
+    "/": "these messages",
+    "/recent": "recent hn articles"
+  }, default=lambda x: repr(x))
+  return Response(rep, content_type="application/json")
+
+@app.route("/recent")
+def recent():
   parser = HNParser()
   links = parser.results()
   Link.fillAll(links)
