@@ -1,13 +1,21 @@
-import re, os, json, simplejson
+import re, os
 from gevent import monkey; monkey.patch_all()
+import lxml.html
+import lxml.etree
 import requests
+import logging
+import base64
+import simplejson
+import hashlib
+import urlparse
+from StringIO import StringIO
 from requests import async
 from flask import Flask, Response
 from itertools import chain
 from datetime import datetime
 from flaskext.sqlalchemy import SQLAlchemy
 from readability.readability import Document
-import logging
+
 logging.basicConfig()
 logger = logging.Logger("hnunderground")
 app = Flask(__name__)
@@ -25,19 +33,40 @@ class Link(db.Model):
   last_updated = db.Column(db.DateTime)
      
   def __init__(self, id, url, title):
-    if not url.startswith("http"):
-      url = "http://news.ycombinator.com/" + url
+    url = urlparse.urljoin("http://news.ycombinator.com/news", url)
     self.id = id
     self.url = url
     self.title = title
     self.article = None
     self.current = True
     
+  def _update(self, response):
+    data = Document(response.text).summary()
+    doc = lxml.html.fromstring(data)
+    images = []
+    for img in doc.xpath("//img"):
+      src = urlparse.urljoin(response.url, img.get("src"))
+      imgResp = requests.get(src)
+      encoded = base64.b64encode(imgResp.content)
+      if len(encoded) < 3000:
+        src = "data:" + imgResp.headers["content-type"] + ";base64," + encoded
+      else:
+        md5 = hashlib.sha1()
+        md5.update(encoded)
+        name = md5.hexdigest()
+        src = name +"." + src.rpartition(".")[2]
+        images.append((src, encoded))
+      img.set("src", src)
+    data = StringIO()
+    data.write(lxml.etree.tostring(doc, pretty_print=True))
+    for (name, imageData) in images:
+      data.write("\n--data:"+name+"\n"+imageData)
+    data.seek(0)
+    self.article = data.read()
+    self.last_updated = datetime.now()
+    
   def refreshAsync(self):
-    def update(response):
-      self.article = Document(response.text).summary()
-      self.last_updated = datetime.now()
-    request = requests.async.get(self.url, hooks=dict( response= update))
+    request = requests.async.get(self.url, hooks=dict( response= self._update))
     return request
   
   def fill(self):
