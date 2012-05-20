@@ -116,7 +116,6 @@ class HNParser(object):
         article = Article(id, url, title)
         article.save()
       articles.append(article)
-      break
     return articles
 
 @app.route("/")
