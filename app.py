@@ -8,43 +8,39 @@ import base64
 import simplejson
 import hashlib
 import urlparse
+import feedparser
 from StringIO import StringIO
 from requests import async
 from flask import Flask, Response
 from itertools import chain
 from datetime import datetime
-from flaskext.sqlalchemy import SQLAlchemy
+import redis
 from readability.readability import Document
 
 logging.basicConfig()
-logger = logging.Logger("hnunderground")
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL')
-db = SQLAlchemy(app)
 
 front_regex = """<a\sid=up_([0-9]*).*?vote.*?<a\shref="([^"]*)".*?>([^<]*)<"""
 
-class Link(db.Model):
-  id = db.Column(db.Integer, primary_key=True)
-  url = db.Column(db.String(255), unique=True)
-  title = db.Column(db.String(255))
-  article = db.Column(db.Text)
-  current = db.Column(db.Boolean)
-  last_updated = db.Column(db.DateTime)
-     
-  def __init__(self, id, url, title):
+def getConnection():
+    return redis.StrictRedis(host='localhost')
+
+class Article():
+  def __init__(self, id, url, title, article = None):
     url = urlparse.urljoin("http://news.ycombinator.com/news", url)
     self.id = id
     self.url = url
     self.title = title
-    self.article = None
-    self.current = True
-    
+    self.article = article
+
   def _update(self, response):
+    app.logger.debug("Updating %s" % response.url)
     data = Document(response.text).summary()
     doc = lxml.html.fromstring(data)
     images = []
-    for img in doc.xpath("//img"):
+    imageElems = doc.xpath("//img")
+    app.logger.debug("%d images for %s",len(imageElems), response.url)
+    for img in imageElems:
       src = urlparse.urljoin(response.url, img.get("src"))
       imgResp = requests.get(src)
       encoded = base64.b64encode(imgResp.content)
@@ -63,48 +59,66 @@ class Link(db.Model):
       data.write("\n--data:"+name+"\n"+imageData)
     data.seek(0)
     self.article = data.read()
-    self.last_updated = datetime.now()
-    
+    self.save()
+
   def refreshAsync(self):
     request = requests.async.get(self.url, hooks=dict( response= self._update))
     return request
-  
+
   def fill(self):
     if self.article is None:
       self.refreshAsync().send()
-  
+
   @classmethod
-  def fillAll(cls, links):
+  def lookup(cls, id):
+    r = getConnection()
+    page = r.get("page_%s" % id)
+    if page is None: return None
+    rep = simplejson.loads(page)
+    id = rep['id']
+    title = rep['title']
+    url = rep['url']
+    article = rep['article']
+    return Article(id, title, url, article=article);
+
+  def save(self):
+    data = {
+      'id': self.id,
+      'url': self.url,
+      'title': self.title,
+      'article': self.article
+    }
+    r = getConnection()
+    r.set("page_%s" % self.id, simplejson.dumps(data));
+    app.logger.debug("saving page_%s" % self.id)
+
+  @classmethod
+  def fillAll(cls, articles):
     reqs = []
-    for link in links:
-      if(link.article is None):
-        reqs.append(link.refreshAsync())
+    for article in articles:
+      if(article.article is None):
+        reqs.append(article.refreshAsync())
     async.map(reqs)
-    
+
 class HNParser(object):
-  def __init__(self, pages = 1):
-    self.pages = pages
-    
+  def __init__(self):
+    pass
   def results(self):
-    pageset = [self.getPage(x) for x in xrange(1,self.pages + 1)]
-    return [x for x in chain(*pageset)]
-    
-  def getPage(self, page):
-    baseUrl = "http://news.ycombinator.com/news"
-    if page > 1:
-      baseUrl += str(page)
-    resp = requests.get(baseUrl)
-    data = resp.text
-    raw = re.findall(front_regex, data)
-    links = []
-    for (id, url, title) in raw:
-      link = Link.query.get(id)
-      if link is None:
-        link = Link(id, url, title)
-        db.session.add(link)
-      links.append(link)
-    return links
-    
+    articles = []
+    baseUrl = "http://news.ycombinator.com/rss"
+    feed = feedparser.parse(baseUrl)
+    for entry in feed.entries:
+      id = re.search("([0-9]+$)", entry.comments).groups(0)[0]
+      url = entry.link
+      title = entry.title
+      article = Article.lookup(id)
+      if article is None:
+        article = Article(id, url, title)
+        article.save()
+      articles.append(article)
+      break
+    return articles
+
 @app.route("/")
 def root():
   rep = simplejson.dumps({
@@ -116,13 +130,11 @@ def root():
 @app.route("/recent")
 def recent():
   parser = HNParser()
-  links = parser.results()
-  Link.fillAll(links)
-  db.session.commit()
-  linkReps = [(l.id, l.url, l.title, l.article, l.last_updated) for l in links]
+  articles = parser.results()
+  Article.fillAll(articles)
+  linkReps = [(l.id, l.url, l.title, l.article) for l in articles]
   rep = simplejson.dumps(linkReps, default=lambda x: repr(x))
   return Response(rep, content_type="application/json")
-  
 
 if __name__ == "__main__":
   # Bind to PORT if defined, otherwise default to 5000.
